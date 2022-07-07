@@ -1,9 +1,58 @@
 import errno
 import os
 import shutil
+import sys
 from subprocess import Popen, PIPE
 
 import pandas as pd
+import pysam
+import tqdm
+import yaml
+
+
+def _load_flagstat(flagstat_file):
+    data = {}
+    with open(flagstat_file, 'rt') as reader:
+        for line in reader:
+            line_split = line.strip().split()
+
+            if 'total (QC-passed reads + QC-failed reads)' in line:
+                data['total'] = (line_split[0], line_split[2])
+            elif 'secondary' in line:
+                data['secondary'] = (line_split[0], line_split[2])
+            elif 'supplementary' in line:
+                data['supplementary'] = (line_split[0], line_split[2])
+            elif 'duplicates' in line:
+                data['duplicates'] = (line_split[0], line_split[2])
+            elif 'mapped' in line:
+                data['mapped'] = (line_split[0], line_split[2])
+            elif 'paired in sequencing' in line:
+                data['paired'] = (line_split[0], line_split[2])
+            elif 'read1' in line:
+                data['read1'] = (line_split[0], line_split[2])
+            elif 'read2' in line:
+                data['read2'] = (line_split[0], line_split[2])
+            elif 'properly paired' in line:
+                data['properly_paired'] = (line_split[0], line_split[2])
+            elif 'singletons' in line:
+                data['singletons'] = (line_split[0], line_split[2])
+    return data
+
+
+def compare_bams(oldbam, newbam, tempdir):
+    old_fstat = os.path.join(tempdir, 'old_flagstat.txt')
+    new_fstat = os.path.join(tempdir, 'new_flagstat.txt')
+
+    cmd = ['samtools', 'flagstat', oldbam]
+    _run_cmd(cmd, output=old_fstat)
+
+    cmd = ['samtools', 'flagstat', newbam]
+    _run_cmd(cmd, output=new_fstat)
+
+    old_fstat = _load_flagstat(old_fstat)
+    new_fstat = _load_flagstat(new_fstat)
+
+    assert old_fstat == new_fstat
 
 
 def _makedirs(dirname):
@@ -48,6 +97,9 @@ def _get_file_type(filepath):
         '.tar.gz': 'tar'
     }
 
+    if os.path.basename(filepath) == 'metadata.yaml':
+        return 'meta_yaml'
+
     return mapping.get(extension, None)
 
 
@@ -59,89 +111,82 @@ def _get_all_files(dirpath):
     return files
 
 
-def _get_new_rgid(rgid, old_sample_id, new_sample_id):
-    assert len(rgid.split('_')) == 4
-    sample, library, lane, flowcell = rgid.split('_')
-    assert sample.replace('_', '').replace('-', '') == old_sample_id or 'DLPNegative' in sample or 'DLPGm' in sample
-    rgid = '_'.join((new_sample_id, library, lane, flowcell))
-    return rgid
+def _update_bam_header(header, old_sample_id, new_sample_id):
+    # allowed_samples = {'DLPNegative', 'DLPGm', old_sample_id}
+
+    comments = header['CO']
+    updated_comments = []
+    for comment in comments:
+        if comment.startswith('CB:'):
+            comment = comment[len('CB:'):]
+            comment = comment.rsplit('-', maxsplit=3)
+            comment = '-'.join(comment[1:])
+            comment = 'CB:' + comment
+        updated_comments.append(comment)
+    header['CO'] = updated_comments
+
+    rg_rename = {}
+
+    for rg in header['RG']:
+        sample, library, lane, flowcell = rg['ID'].rsplit('_', maxsplit=3)
+
+        # assert sample in allowed_samples
+        assert rg['ID'] not in rg_rename
+
+        rg_id = f'{new_sample_id}_{library}_{lane}_{flowcell}'
+
+        rg_rename[rg['ID']] = rg_id
+
+        rg['ID'] = rg_id
+        rg['PU'] = f'{lane}_{flowcell}'
+        rg['SM'] = new_sample_id
+
+    return rg_rename
 
 
-def _update_rg_line(rg, old_sample_id, new_sample_id):
-    rg = rg.strip().split()
+def _update_bam_reads(input_bam, output_bam, old_sample_id, rg_mapping):
+    # allowed_samples = {'DLPNegative', 'DLPGm', old_sample_id}
 
-    assert rg[0] == '@RG'
-    assert rg[1].startswith('ID:')
-
-    rgid = rg[1][len('ID:'):]
-    rg[1] = 'ID:' + _get_new_rgid(rgid, old_sample_id, new_sample_id)
-
-    sample_idx = [i for i, v in enumerate(rg) if v.startswith('SM:')]
-    assert len(sample_idx) == 1
-    sample_idx = sample_idx[0]
-
-    assert rg[sample_idx][len('SM:'):] == old_sample_id
-
-    rg[sample_idx] = 'SM:{}'.format(new_sample_id)
-
-    return '\t'.join(rg) + '\n'
-
-
-def _update_barcode_comment(barcode_line):
-    assert barcode_line.startswith('@CO\tCB:')
-
-    barcode = barcode_line[len('@CO\tCB:'):]
-    assert len(barcode.split('-')) == 4
-    barcode = '-'.join(barcode.split('-')[1:])
-
-    return '@CO\tCB:{}\n'.format(barcode)
+    for a in tqdm.tqdm(input_bam, total=input_bam.mapped + input_bam.unmapped):
+        tags = []
+        for t in a.tags:
+            if t[0] == 'RG':
+                tags.append(('RG', rg_mapping[t[1]]))
+            elif t[0] == 'CB':
+                cell_id = t[1]
+                cell_info = cell_id.rsplit('-', maxsplit=3)
+                # assert cell_info[0] in allowed_samples
+                new_cell_id = '-'.join(cell_info[1:])
+                tags.append(('CB', new_cell_id))
+            else:
+                tags.append(t)
+        a.tags = tags
+        output_bam.write(a)
 
 
-def _update_read(read, old_sample_id, new_sample_id):
-    read = read.strip().split('\t')
-
-    barcode_idx = [i for i, v in enumerate(read) if v.startswith('CB:Z:')]
-    assert len(barcode_idx) == 1
-    barcode_idx = barcode_idx[0]
-    read[barcode_idx] = 'CB:Z:' + '-'.join(read[barcode_idx][len('CB:Z:'):].split('-')[1:])
-
-    rg_idx = [i for i, v in enumerate(read) if v.startswith('RG:Z:')]
-    assert len(rg_idx) == 1
-    rg_idx = rg_idx[0]
-
-    read[rg_idx] = 'CB:Z:' + _get_new_rgid(read[rg_idx], old_sample_id, new_sample_id)
-
-    return '\t'.join(read) + '\n'
-
-
-def update_bam(bamfile, tempdir, old_sample_id, new_sample_id, output_bam):
+def update_bam(bamfile, output_bam, old_sample_id, new_sample_id, tempdir):
     if os.path.getsize(bamfile) == 7:
         print('empty bam: {}'.format(bamfile))
         shutil.copyfile(bamfile, output_bam)
+        shutil.copyfile(bamfile + '.bai', output_bam + '.bai')
         return
 
-    sampath = os.path.join(tempdir, 'converted.sam')
-    cmd = ['samtools', 'view', '-h', '-o', sampath, bamfile]
-    _run_cmd(cmd)
+    bam = pysam.AlignmentFile(bamfile, 'rb')
+    header = bam.header.to_dict()
 
-    updated_sam = os.path.join(tempdir, 'updated.sam')
-    with open(sampath, 'rt') as reader, open(updated_sam, 'wt') as writer:
-        for line in reader:
+    rg_mapping = _update_bam_header(header, old_sample_id, new_sample_id)
 
-            if not line.startswith('@'):
-                line = _update_read(line, old_sample_id, new_sample_id)
-            elif line.startswith('@RG'):
-                line = _update_rg_line(line, old_sample_id, new_sample_id)
-            elif line.startswith('@CO'):
-                line = _update_barcode_comment(line)
+    assert len([v['ID'] for v in header['RG']]) == len(set([v['ID'] for v in header['RG']]))
 
-            writer.write(line)
+    with pysam.AlignmentFile(output_bam, 'wb', header=header) as output:
+        _update_bam_reads(bam, output, old_sample_id, rg_mapping)
 
-    cmd = ['samtools', 'view', '-bSh', '-o', output_bam, updated_sam]
-    _run_cmd(cmd)
+    bam.close()
 
     cmd = ['samtools', 'index', output_bam]
     _run_cmd(cmd)
+
+    compare_bams(bamfile, output_bam, tempdir)
 
 
 def _update_sample(curr_sample_id, old_sample_id, new_sample_id):
@@ -156,19 +201,37 @@ def _update_cell_id(cell_id):
     if cell_id == 'reference':
         return cell_id
     else:
-        return '-'.join(cell_id.split('-')[1:])
+        return '-'.join(cell_id.rsplit('-', maxsplit=3)[1:])
 
 
 def update_csv(filepath, old_sample_id, new_sample_id, output_csv):
     df = pd.read_csv(filepath)
 
     if 'sample_id' in df.columns.values:
-        df['sample_id'] = df['sample_id'].apply(lambda x: _update_sample(x, old_sample_id, new_sample_id))
+        samples = list(df[~ df['is_control']]['sample_id'].unique())
+        assert len(samples) == 1
+        assert samples[0] == old_sample_id
+        df['sample_id'] = new_sample_id
 
     if 'cell_id' in df.columns.values:
         df['cell_id'] = df['cell_id'].apply(lambda x: _update_cell_id(x))
 
     df.to_csv(output_csv, index=False)
+
+
+def update_metadata_yaml(meta_yaml_input, meta_yaml_output, old_sample, new_sample):
+    with open(meta_yaml_input, 'rt') as reader:
+        data = yaml.safe_load(reader)
+
+    cells = data['meta']['cell_ids']
+    cells = ['-'.join(v.rsplit('-', maxsplit=3)[1:]) for v in cells]
+    data['meta']['cell_ids'] = cells
+
+    assert old_sample in data['meta']['sample_ids']
+    data['meta']['sample_ids'] = [new_sample]
+
+    with open(meta_yaml_output, 'wt') as writer:
+        yaml.dump(data, writer, default_flow_style=False)
 
 
 def mondrian(old_sample_id, new_sample_id, input_dir, output_dir, tempdir):
@@ -178,15 +241,32 @@ def mondrian(old_sample_id, new_sample_id, input_dir, output_dir, tempdir):
     allfiles = _get_all_files(input_dir)
 
     for filepath in allfiles:
+
         output_path = os.path.join(output_dir, os.path.basename(filepath))
         if _get_file_type(filepath) == 'bam':
-            update_bam(filepath, tempdir, old_sample_id, new_sample_id, output_path)
+            update_bam(filepath, output_path, old_sample_id, new_sample_id, tempdir)
         elif _get_file_type(filepath) == 'csv':
             update_csv(filepath, old_sample_id, new_sample_id, output_path)
         elif _get_file_type(filepath) in ['csv_yaml', 'pdf', 'tar']:
             shutil.copyfile(filepath, output_path)
+        elif _get_file_type(filepath) == 'meta_yaml':
+            update_metadata_yaml(filepath, output_path, old_sample_id, new_sample_id)
         else:
             print('skipping: {}'.format(filepath))
 
 
-mondrian('RPE-Noco', 'A12345', 'results', 'results_updated', 'tempdir')
+old_sample_id = sys.argv[1]
+new_sample_id = sys.argv[2]
+inputdir = sys.argv[3]
+outputdir = sys.argv[4]
+tempdir = sys.argv[5]
+
+mondrian(
+    old_sample_id, new_sample_id, inputdir, outputdir, tempdir
+)
+
+# mondrian(
+#     'RPE-Noco', 'A12345',
+#     '/juno/work/shah/isabl_data_lake/analyses/40/15/24015/results/',
+#     'results_updated', 'tempdir'
+# )

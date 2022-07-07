@@ -11,14 +11,15 @@ def _get_separator(filepath):
 
     with opener(filepath, 'rt') as reader:
         header = reader.readline()
+        # print(header)
 
-        if ',' in header and '\t' in header:
-            raise Exception()
+        # if ',' in header and '\t' in header:
+        #     raise Exception()
 
-        if ',' in header:
-            return ','
-        elif '\t' in header:
+        if '\t' in header:
             return '\t'
+        elif ',' in header:
+            return ','
         else:
             raise Exception('unknown separator in {}'.format(filepath))
 
@@ -35,7 +36,7 @@ def _makedirs(dirname):
 
 def _run_cmd(cmd):
     cmd = ' '.join(cmd)
-    os.system(cmd, shell=True)
+    os.system(cmd)
 
 
 def _get_file_type(filepath):
@@ -46,6 +47,7 @@ def _get_file_type(filepath):
         '.csv.gz.yaml': 'csv_yaml',
         '.bam': 'bam',
         '.pdf': 'pdf',
+        '.maf': 'maf',
         '.tar': 'tar',
         '.tar.gz': 'tar',
         '.vcf': 'vcf',
@@ -92,7 +94,7 @@ def update_bam(bamfile, tempdir, old_sample_id, new_sample_id, output_bam):
 
             writer.write(line)
 
-    cmd = ['samtools', 'reheader', updated_header, bamfile, '-o', output_bam]
+    cmd = ['samtools', 'reheader', updated_header, bamfile, '>', output_bam]
     _run_cmd(cmd)
 
     cmd = ['samtools', 'index', output_bam]
@@ -113,21 +115,21 @@ def update_germline_vcf(filepath, old_sample_id, new_sample_id, output_path, tem
 
     temp_output_path = os.path.join(tempdir, 'temp_germline_output.vcf')
 
-    with opener(filepath, 'rt') as reader, opener(temp_output_path, 'wt') as writer:
+    with opener(filepath, 'rt') as reader, open(temp_output_path, 'wt') as writer:
         for line in reader:
             if line.startswith('#') and not line.startswith('##'):
                 line = line.strip().split('\t')
-                assert line[-1] == old_sample_id
+                assert line[-1] == old_sample_id, (line, old_sample_id)
                 line[-1] = new_sample_id
                 line = '\t'.join(line) + '\n'
             writer.write(line)
 
     if filepath.endswith('.gz'):
-        cmd = ['bgzip', temp_output_path, '-c', '>', filepath]
+        cmd = ['bgzip', temp_output_path, '-c', '>', output_path]
         _run_cmd(cmd)
-        cmd = ['tabix', '-f', '-p', 'vcf', filepath]
+        cmd = ['tabix', '-f', '-p', 'vcf', output_path]
         _run_cmd(cmd)
-        cmd = ['bcftools', 'index', filepath]
+        cmd = ['bcftools', 'index', output_path]
         _run_cmd(cmd)
     else:
         shutil.copyfile(temp_output_path, output_path)
@@ -138,7 +140,7 @@ def update_paired_vcf(filepath, old_normal_id, new_normal_id, old_tumour_id, new
 
     temp_output_path = os.path.join(tempdir, 'temp_germline_output.vcf')
 
-    with opener(filepath, 'rt') as reader, opener(temp_output_path, 'wt') as writer:
+    with opener(filepath, 'rt') as reader, open(temp_output_path, 'wt') as writer:
         for line in reader:
             if line.startswith('#') and not line.startswith('##'):
                 line = line.replace(old_tumour_id, new_tumour_id)
@@ -146,11 +148,11 @@ def update_paired_vcf(filepath, old_normal_id, new_normal_id, old_tumour_id, new
             writer.write(line)
 
     if filepath.endswith('.gz'):
-        cmd = ['bgzip', temp_output_path, '-c', '>', filepath]
+        cmd = ['bgzip', temp_output_path, '-c', '>', output_path]
         _run_cmd(cmd)
-        cmd = ['tabix', '-f', '-p', 'vcf', filepath]
+        cmd = ['tabix', '-f', '-p', 'vcf', output_path]
         _run_cmd(cmd)
-        cmd = ['bcftools', 'index', filepath]
+        cmd = ['bcftools', 'index', output_path]
         _run_cmd(cmd)
     else:
         shutil.copyfile(temp_output_path, output_path)
@@ -258,6 +260,7 @@ def somatic(old_tumour_id, new_tumour_id, old_normal_id, new_normal_id, input_di
         else:
             print('skipping: {}'.format(filepath))
 
+
 def titan(old_tumour_id, new_tumour_id, old_normal_id, new_normal_id, input_dir, output_dir, tempdir):
     _makedirs(tempdir)
     _makedirs(output_dir)
@@ -272,38 +275,41 @@ def titan(old_tumour_id, new_tumour_id, old_normal_id, new_normal_id, input_dir,
                 filepath, old_normal_id, new_normal_id, old_tumour_id, new_tumour_id, output_path,
                 tempdir
             )
-        elif _get_file_type(filepath) == 'vcf':
+        elif _get_file_type(filepath) == 'csv':
             if filepath.endswith('.seg'):
                 update_csv(filepath, old_tumour_id, new_tumour_id, output_path, sample_col='sample')
             elif 'titan_parsed' in filepath or 'titan_segs' in filepath:
                 update_csv(filepath, old_tumour_id, new_tumour_id, output_path, sample_col='Sample')
             else:
                 shutil.copyfile(filepath, output_path)
-
+        elif _get_file_type(filepath) in ['csv_yaml', 'pdf', 'tar']:
+            shutil.copyfile(filepath, output_path)
+        else:
+            print('skip:{}'.format(filepath))
 
 
 alignment(
-    'AK-RT-020-N_NORMAL', 'A12345',
+    'AK-RT-020-N', 'A12345',
     '/juno/work/shah/isabl_data_lake/analyses/32/74/23274/results/AK-RT-020-N_NORMAL/', 'results_updated',
     'tempdir'
 )
-germline(
-    'AK-RT-020-N_NORMAL', 'A12345',
-    '/juno/work/shah/isabl_data_lake/analyses/38/35/23835/results/germline/AK-RT-020-N/', 'results_updated',
-    'tempdir'
-)
-breakpoint(
-    'AK-RT-020-T', 'T12345', 'AK-RT-020-N', 'N12345',
-    '/juno/work/shah/isabl_data_lake/analyses/45/73/24573/results/breakpoints/AK-RT-020-T', 'results_updated',
-    'tempdir'
-)
-somatic(
-    'AK-RT-020-T', 'T12345', 'AK-RT-020-N', 'N12345',
-    '/juno/work/shah/isabl_data_lake/analyses/37/84/23784/results/somatic/AK-RT-020-T', 'results_updated',
-    'tempdir'
-)
-titan(
-    'AK-RT-020-T', 'T12345', 'AK-RT-020-N', 'N12345',
-    '/juno/work/shah/isabl_data_lake/analyses/37/96/23796/results/copynumber/AK-RT-020-T/titan', 'results_updated',
-    'tempdir'
-)
+# germline(
+#     'AK-RT-020-N', 'A12345',
+#     '/juno/work/shah/isabl_data_lake/analyses/38/35/23835/results/germline/AK-RT-020-N/', 'results_updated',
+#     'tempdir'
+# )
+# breakpoint(
+#     'AK-RT-020-T', 'T12345', 'AK-RT-020-N', 'N12345',
+#     '/juno/work/shah/isabl_data_lake/analyses/45/73/24573/results/breakpoints/AK-RT-020-T', 'results_updated',
+#     'tempdir'
+# )
+# somatic(
+#     'AK-RT-020-T', 'T12345', 'AK-RT-020-N', 'N12345',
+#     '/juno/work/shah/isabl_data_lake/analyses/37/84/23784/results/somatic/AK-RT-020-T', 'results_updated',
+#     'tempdir'
+# )
+# titan(
+#     'AK-RT-020-T', 'T12345', 'AK-RT-020-N', 'N12345',
+#     '/juno/work/shah/isabl_data_lake/analyses/37/96/23796/results/copynumber/AK-RT-020-T/titan', 'results_updated',
+#     'tempdir'
+# )
